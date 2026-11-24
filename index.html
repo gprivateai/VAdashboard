@@ -45,7 +45,7 @@
   .chartbox { position:relative; height:260px; }
   .hidden { display:none !important; }
   .saving { position:fixed; bottom:16px; right:16px; background:#111827; color:#fff; padding:8px 12px; border-radius:8px; font-size:13px; }
-  @media (max-width:700px){ .hide-sm { display:none; } th, td { padding:6px 4px; } }
+  @media (max-width:700px){ .hide-sm { display:none; } th, td { padding:6px 4px; } main { padding:12px; } .grid { grid-template-columns:1fr 1fr; gap:8px; } .stat { padding:10px; } .stat .val { font-size:20px; } }
 </style>
 </head>
 <body>
@@ -70,7 +70,9 @@
   <main>
     <section id="v-dashboard"></section>
     <section id="v-tasks" class="hidden"></section>
+    <section id="v-eod" class="hidden"></section>
     <section id="v-time" class="hidden"></section>
+    <section id="v-payments" class="hidden"></section>
     <section id="v-users" class="hidden"></section>
     <section id="v-settings" class="hidden"></section>
   </main>
@@ -92,17 +94,22 @@
 </form></dialog>
 
 <dialog id="d-time"><form id="f-time">
-  <h2>Log time</h2>
+  <h2>Add to EOD</h2>
   <label>Task</label><select name="task_id"></select>
-  <div class="two"><div><label>Date</label><input name="entry_date" type="date" required></div><div><label>Minutes</label><input name="minutes" type="number" min="1" step="1" required></div></div>
+  <div class="two"><div><label>Date</label><input name="entry_date" type="date" required></div><div><label>Minutes (can fill in at EOD)</label><input name="minutes" type="number" min="1" step="1"></div></div>
   <div style="margin-top:6px">
     <button type="button" class="btn sec sm qm" data-m="5">+5</button> <button type="button" class="btn sec sm qm" data-m="10">+10</button>
     <button type="button" class="btn sec sm qm" data-m="15">+15</button> <button type="button" class="btn sec sm qm" data-m="30">+30</button>
     <button type="button" class="btn sec sm qm" data-m="60">+60</button>
   </div>
   <label>Category (for analytics)</label><input name="category" list="cats">
-  <label>What was done</label><input name="note">
+  <label>What was done (shows in the EOD)</label><input name="note" required>
   <div class="actions"><button type="button" class="btn sec" onclick="this.closest('dialog').close()">Cancel</button><button class="btn">Save</button></div>
+</form></dialog>
+<dialog id="d-ask"><form method="dialog" style="padding:18px">
+  <p id="ask-msg" style="margin:0 0 10px;white-space:pre-wrap"></p>
+  <input id="ask-in" class="hidden" style="width:100%"><textarea id="ask-ta" class="hidden" readonly style="min-height:200px"></textarea>
+  <div class="actions"><button type="button" class="btn sec" id="ask-cancel">Cancel</button><button type="button" class="btn" id="ask-ok">OK</button></div>
 </form></dialog>
 <datalist id="cats"></datalist>
 
@@ -126,29 +133,69 @@ const filt = { q:'', status:'open', owner:'', category:'' };
 /* ---------- storage helpers (wrapped: may be blocked) ---------- */
 const store = { get(k){ try { return localStorage.getItem(k); } catch { return null; } }, set(k,v){ try { localStorage.setItem(k,v); } catch {} }, del(k){ try { localStorage.removeItem(k); } catch {} } };
 const sess = { get(k){ try { return sessionStorage.getItem(k); } catch { return null; } }, set(k,v){ try { sessionStorage.setItem(k,v); } catch {} }, del(k){ try { sessionStorage.removeItem(k); } catch {} } };
-const token = () => store.get('va_gh_token');
-
-/* ---------- GitHub data ---------- */
-const b64enc = s => btoa(unescape(encodeURIComponent(s)));
-const b64dec = s => decodeURIComponent(escape(atob(s.replace(/\n/g, ''))));
-const apiUrl = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${DATA_PATH}`;
-async function loadData() {
-  const r = await fetch(`${DATA_PATH}?t=${Date.now()}`, { cache: 'no-store' });
+/* ---------- data ----------
+   In Claude (admin): data lives in the artifact database (doc state/main) and saves there.
+   On GitHub Pages: read-only, loads data.json next to this file. */
+let stateRef = null;
+async function claudeUse(name) { try { return (window.claude && window.claude.use) ? await window.claude.use(name) : null; } catch { return null; } }
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+async function fetchFile() {
+  const r = await fetch(`data.json?t=${Date.now()}`, { cache: 'no-store' });
   if (!r.ok) throw new Error('Could not load data.json');
-  DB = await r.json();
+  return r.json();
 }
-async function saveData(msg = 'Update dashboard data') {
-  if (!token()) { alert('This device has no GitHub token, so changes cannot be saved. Add it in Settings.'); return false; }
+async function loadData() {
+  const db = await claudeUse('db');
+  if (db) {
+    try {
+      stateRef = db.doc('state/main');
+      const snap = await withTimeout(stateRef.get(), 10000);
+      if (snap.exists) { DB = structuredClone(snap.data()); startLive(); return; }
+    } catch { stateRef = null; }
+  }
+  DB = await fetchFile();
+}
+/* live sync: pick up changes saved elsewhere (another tab, or Claude) so a later save doesn't overwrite them */
+let liveUnsub = null, renderLater = false;
+function startLive() {
+  if (!stateRef || liveUnsub || typeof stateRef.onSnapshot !== 'function') return;
+  liveUnsub = stateRef.onSnapshot(snap => {
+    if (!snap.exists || snap.metadata?.hasPendingWrites || snap.metadata?.fromCache) return;
+    const nd = snap.data(); if (JSON.stringify(nd) === JSON.stringify(DB)) return;
+    DB = structuredClone(nd);
+    if (!me) return;
+    if (document.querySelector('dialog[open]') || document.activeElement?.matches('input,textarea,select')) renderLater = true; else render();
+  }, () => {});
+  document.addEventListener('focusout', () => setTimeout(() => { if (renderLater && !document.querySelector('dialog[open]')) { renderLater = false; render(); } }, 300));
+}
+async function saveData() {
+  if (!stateRef) { alertA('This copy is read-only. Make changes in the Claude version of the dashboard.'); return false; }
   $('#saving').classList.remove('hidden');
-  try {
-    if (!fileSha) { const g = await fetch(`${apiUrl}?ref=${GH_BRANCH}`, { headers: { Authorization: `Bearer ${token()}` } }); if (g.ok) fileSha = (await g.json()).sha; }
-    const r = await fetch(apiUrl, { method: 'PUT', headers: { Authorization: `Bearer ${token()}`, Accept: 'application/vnd.github+json' },
-      body: JSON.stringify({ message: msg, content: b64enc(JSON.stringify(DB, null, 1)), sha: fileSha, branch: GH_BRANCH }) });
-    const j = await r.json();
-    if (!r.ok) { alert('Save failed: ' + (j.message || r.status) + (r.status === 409 ? '. Reload the page and try again.' : '')); return false; }
-    fileSha = j.content.sha; return true;
-  } finally { $('#saving').classList.add('hidden'); }
+  try { await stateRef.set(DB); return true; }
+  catch (e) { alertA('Save failed: ' + (e.message || e.code || e) + '. Reload the page and try again.'); return false; }
+  finally { $('#saving').classList.add('hidden'); }
 }
+async function exportJson() {
+  const text = JSON.stringify(DB, null, 1), dl = await claudeUse('downloads');
+  if (dl) { try { await dl.save({ filename: 'data.json', data: text }); return; } catch (e) { if (e && e.code !== 'unavailable') return; } }
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' })); a.download = 'data.json'; a.click();
+}
+
+/* ---------- in-page dialogs (browser pop-ups are blocked inside Claude) ---------- */
+function ask(msg, o = {}) {
+  return new Promise(res => {
+    const d = $('#d-ask'), inp = $('#ask-in'), ta = $('#ask-ta');
+    $('#ask-msg').textContent = msg; inp.value = ''; ta.value = o.text || '';
+    inp.classList.toggle('hidden', !o.input); ta.classList.toggle('hidden', !o.text); $('#ask-cancel').classList.toggle('hidden', !!o.ok);
+    const done = v => { d.close(); res(v); };
+    $('#ask-ok').onclick = () => done(o.input ? inp.value : true);
+    $('#ask-cancel').onclick = () => done(o.input ? null : false);
+    d.oncancel = e => { e.preventDefault(); done(o.input ? null : false); };
+    d.querySelector('form').onsubmit = e => { e.preventDefault(); $('#ask-ok').click(); };
+    d.showModal(); if (o.input) inp.focus(); if (o.text) ta.select();
+  });
+}
+const confirmA = m => ask(m), alertA = m => ask(m, { ok: true }), promptA = m => ask(m, { input: true });
 
 /* ---------- passcodes ---------- */
 async function hash(user, pass) {
@@ -184,12 +231,14 @@ $('#li-pass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#li-b
 
 $('#out-btn').onclick = () => { sess.del('va_user'); location.reload(); };
 const isAdmin = () => me && me.role === 'admin';
-const canEdit = () => false;  // read-only site: updates come from a new data.json upload
+const canEdit = () => isAdmin() && !!stateRef;
 
 function startApp() {
   show('#app'); $('#who').textContent = `${me.name || me.username} · ${me.role}`;
   const items = [['dashboard', 'Dashboard'], ['tasks', 'Tasks']];
-  if (isAdmin()) items.push(['time', 'Time log']);
+  if (canEdit()) items.push(['eod', 'EOD']);
+  if (isAdmin()) items.push(['time', 'Time log'], ['payments', 'Payments']);
+  if (canEdit()) items.push(['users', 'Users'], ['settings', 'Settings']);
   $('#nav').innerHTML = items.map(([k, l]) => `<button data-v="${k}">${l}</button>`).join('');
   $('#nav').onclick = e => { const v = e.target.dataset.v; if (v) { view = v; render(); } };
   render();
@@ -199,52 +248,137 @@ function render() {
   document.querySelectorAll('#nav button').forEach(b => b.classList.toggle('on', b.dataset.v === view));
   document.querySelectorAll('main > section').forEach(s => s.classList.add('hidden'));
   $('#v-' + view).classList.remove('hidden');
-  ({ dashboard: renderDashboard, tasks: renderTasks, time: renderTime, users: renderUsers, settings: renderSettings })[view]();
+  ({ dashboard: renderDashboard, tasks: renderTasks, eod: renderEod, time: renderTime, payments: renderPayments, users: renderUsers, settings: renderSettings })[view]();
 }
 const newId = () => DB.next_id++;
 
 /* ---------- hours ---------- */
-function hoursSummary() {
-  const S = DB.settings, budget = Number(S.weekly_budget_hours ?? 15);
-  const start = weekStart(S.tracking_start || today()), opening = Number(S.opening_balance_hours ?? 0), curWeek = weekStart(today());
+function hoursSummary(ws) {
+  const S = DB.settings, budget = Number(S.weekly_budget_hours ?? 15), nowWeek = weekStart(today());
+  const start = weekStart(S.tracking_start || today()), opening = Number(S.opening_balance_hours ?? 0), curWeek = ws || nowWeek, weekEnd = addDays(curWeek, 7);
   const tracked = DB.entries.filter(e => e.entry_date >= start);
   const minsBefore = tracked.filter(e => e.entry_date < curWeek).reduce((a, e) => a + e.minutes, 0);
-  const minsThis = tracked.filter(e => e.entry_date >= curWeek).reduce((a, e) => a + e.minutes, 0);
+  const minsThis = DB.entries.filter(e => e.entry_date >= curWeek && e.entry_date < weekEnd).reduce((a, e) => a + e.minutes, 0);
   const weeksDone = Math.max(0, Math.round((parseD(curWeek) - parseD(start)) / (7 * 864e5)));
   const carried = opening + minsBefore / 60 - budget * weeksDone, thisH = minsThis / 60;
-  return { budget, carried, thisH, needed: Math.max(0, budget - carried - thisH), curWeek };
+  return { budget, carried, thisH, needed: Math.max(0, budget - carried - thisH), curWeek, weekEnd,
+    isCurrent: curWeek === nowWeek, preTracking: curWeek < start, after: carried + thisH - budget };
 }
+function weekOptions() {
+  const now = weekStart(today()), dates = DB.entries.map(e => e.entry_date).concat([DB.settings.tracking_start || today()]).sort();
+  let w = weekStart(dates[0] < now ? dates[0] : now); const out = [];
+  while (w <= now) { out.unshift(w); w = addDays(w, 7); }
+  return out;
+}
+const weekLabel = ws => `${fmtD(ws)} – ${fmtD(addDays(ws, 6))}`;
+let selWeek = null;
 function weeklySeries(n = 8) {
   const cur = weekStart(today()), out = [];
   for (let i = n - 1; i >= 0; i--) { const ws = addDays(cur, -7 * i), we = addDays(ws, 7);
     out.push({ label: fmtD(ws), h: +(DB.entries.filter(e => e.entry_date >= ws && e.entry_date < we).reduce((a, e) => a + e.minutes, 0) / 60).toFixed(2) }); }
   return out;
 }
+function weekWorked(ws) { const we = addDays(ws, 7); return DB.entries.filter(e => e.entry_date >= ws && e.entry_date < we).reduce((a, e) => a + e.minutes, 0) / 60; }
+function paySummary() {
+  const rows = [...(DB.payments || [])].sort((a, b) => a.week_start.localeCompare(b.week_start)); let run = 0;
+  const out = rows.map(p => { const worked = (p.hours_worked !== null && p.hours_worked !== undefined && p.hours_worked !== '') ? Number(p.hours_worked) : weekWorked(p.week_start);
+    const diff = worked - Number(p.hours_paid || 0); run += diff; return { ...p, worked, diff, run }; });
+  return { rows: out, balance: run, paidTotal: rows.reduce((a, p) => a + Number(p.hours_paid || 0), 0) };
+}
+const sgn = n => (n >= 0 ? '+' : '') + n.toFixed(2);
+function renderPayments() {
+  const P = paySummary();
+  $('#v-payments').innerHTML = `
+  <div class="grid"><div class="stat"><div class="lbl">Hours paid (all weeks)</div><div class="val">${P.paidTotal.toFixed(2)} h</div><div class="sub">${P.rows.length} week(s) recorded</div></div>
+  <div class="stat"><div class="lbl">Worked vs paid</div><div class="val ${P.balance < 0 ? 'neg' : 'pos'}">${sgn(P.balance)} h</div><div class="sub">${P.balance < 0 ? 'Paid but not yet worked: to recoup' : 'Worked beyond what was paid'}</div></div></div>
+  ${canEdit() ? `<div class="card" style="margin-top:16px"><h2>Record a payment</h2><div class="filters">
+    <label class="muted">Week starting <input id="pw" type="date"></label>
+    <label class="muted">Hours paid <input id="ph" type="number" step="0.01" min="0" style="width:90px" value="${esc(DB.settings.weekly_budget_hours ?? 15)}"></label>
+    <label class="muted">Paid on <input id="pd" type="date"></label>
+    <label class="muted">Hours worked <input id="pk" type="number" step="0.01" min="0" style="width:90px"></label><span class="muted" id="pk-src"></span>
+    <input id="pn" placeholder="Note (e.g. 15-hour minimum)" style="min-width:220px"><button class="btn" id="p-add">Save</button></div><div class="err" id="p-err"></div></div>` : ''}
+  <div class="card" style="margin-top:16px"><h2>Payments by week</h2>${P.rows.length ? `<table><tr><th>Week of</th><th>Worked</th><th>Paid</th><th>Difference</th><th>Running balance</th><th class="hide-sm">Paid on</th><th class="hide-sm">Note</th>${canEdit() ? '<th></th>' : ''}</tr>
+    ${P.rows.slice().reverse().map(p => `<tr><td>${fmtD(p.week_start)}</td><td>${p.worked.toFixed(2)} h</td><td>${Number(p.hours_paid).toFixed(2)} h</td>
+      <td class="${p.diff < 0 ? 'neg' : 'pos'}">${sgn(p.diff)}</td><td class="${p.run < 0 ? 'neg' : 'pos'}">${sgn(p.run)}</td>
+      <td class="hide-sm">${p.paid_on ? fmtD(p.paid_on) : '<span class="muted">Not yet</span>'}</td><td class="hide-sm">${esc(p.note || '')}</td>
+      ${canEdit() ? `<td class="row-actions">${p.paid_on ? '' : `<button class="btn sec sm" data-paid="${p.id}">Mark paid today</button> `}<button class="btn sec sm" data-pdel="${p.id}">Remove</button></td>` : ''}</tr>`).join('')}</table>` : '<p class="muted">No payments recorded yet.</p>'}</div>`;
+  if (!canEdit()) return;
+  const pw = $('#pw');
+  pw.onchange = () => {
+    if (!pw.value) return; const ws = weekStart(pw.value), logged = weekWorked(ws), ex = (DB.payments || []).find(p => p.week_start === ws);
+    if (ws !== pw.value) pw.value = ws;
+    $('#pk').value = logged ? logged.toFixed(2) : (ex && ex.hours_worked != null ? ex.hours_worked : '');
+    $('#pk-src').textContent = logged ? `From the time log (${weekLabel(ws)})` : `Nothing logged for ${weekLabel(ws)}: enter hours`;
+    if (ex) { $('#ph').value = ex.hours_paid; $('#pd').value = ex.paid_on || ''; $('#pn').value = ex.note || ''; $('#pk-src').textContent += ' · editing the existing record'; }
+  };
+  $('#p-add').onclick = async () => {
+    const w = pw.value, h = $('#ph').value; if (!w || h === '') return $('#p-err').textContent = 'Enter the week and hours paid.';
+    const ws = weekStart(w), logged = weekWorked(ws), k = $('#pk').value;
+    const rec = { week_start: ws, hours_paid: Number(h), hours_worked: logged ? null : (k === '' ? null : Number(k)), paid_on: $('#pd').value || null, note: $('#pn').value.trim() || null };
+    const ex = (DB.payments ||= []).find(p => p.week_start === ws);
+    if (ex) Object.assign(ex, rec); else DB.payments.push({ id: newId(), ...rec });
+    await saveData(); render(); };
+  $('#v-payments').onclick = async e => { const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.pdel) { if (!(await confirmA('Remove this payment record?'))) return; DB.payments = DB.payments.filter(p => p.id != b.dataset.pdel); await saveData(); render(); }
+    if (b.dataset.paid) { DB.payments.find(p => p.id == b.dataset.paid).paid_on = today(); await saveData(); render(); } };
+}
 const taskMins = id => DB.entries.filter(e => e.task_id === id).reduce((a, e) => a + e.minutes, 0);
 
 /* ---------- dashboard ---------- */
 function renderDashboard() {
-  const H = hoursSummary(), t = today(), in7 = addDays(t, 7), open = DB.tasks.filter(x => x.status !== 'Done');
+  const isAll = selWeek === 'all';
+  const H = hoursSummary(isAll ? null : selWeek), t = today(), in7 = addDays(t, 7), open = DB.tasks.filter(x => x.status !== 'Done');
+  const R = isAll ? { from: '0000-01-01', to: '9999-12-31' } : { from: H.curWeek, to: H.weekEnd };
+  const wkEntries = DB.entries.filter(e => e.entry_date >= R.from && e.entry_date < R.to).sort((a, b) => a.entry_date.localeCompare(b.entry_date));
+  const wkDays = {}; wkEntries.forEach(e => (wkDays[e.entry_date] ||= []).push(e));
   const needsG = open.filter(x => x.status === 'Needs Dr. G' || x.owner === 'Dr. Ghiassi');
   const waiting = open.filter(x => x.status === 'Waiting' || x.owner === 'Waiting on');
   const dueSoon = open.filter(x => x.due_date && x.due_date <= in7).sort((a, b) => a.due_date.localeCompare(b.due_date));
-  const doneWk = DB.tasks.filter(x => x.status === 'Done' && x.completed_at && x.completed_at >= H.curWeek);
+  const PS = paySummary();
+  const doneWk = DB.tasks.filter(x => x.status === 'Done' && x.completed_at && x.completed_at >= R.from && x.completed_at < R.to);
+  const wl = isAll ? 'in total' : H.isCurrent ? 'this week' : 'that week';
+  const weeksAsc = weekOptions().slice().reverse(), totalH = DB.entries.reduce((a, e) => a + e.minutes, 0) / 60;
   $('#v-dashboard').innerHTML = `
+  <div class="filters"><label class="muted" for="wk-sel">Week (Mon – Sun)</label>
+    <select id="wk-sel"><option value="all" ${isAll ? 'selected' : ''}>All weeks (running total)</option>${weekOptions().map((w, i) => `<option value="${w}" ${!isAll && w === H.curWeek ? 'selected' : ''}>${weekLabel(w)}${i === 0 ? ' (this week)' : ''}</option>`).join('')}</select></div>
   <div class="grid">
-    <div class="stat"><div class="lbl">Hours this week</div><div class="val">${H.thisH.toFixed(2)} <span class="muted" style="font-size:14px">/ ${H.budget}</span></div><div class="sub">Week of ${fmtD(H.curWeek)}</div></div>
-    <div class="stat"><div class="lbl">Balance carried in</div><div class="val ${H.carried < 0 ? 'neg' : 'pos'}">${H.carried >= 0 ? '+' : ''}${H.carried.toFixed(2)} h</div><div class="sub">${H.carried < 0 ? 'Hours to recoup' : 'Hours ahead'}</div></div>
-    <div class="stat"><div class="lbl">Still needed this week</div><div class="val">${H.needed.toFixed(2)} h</div><div class="sub">To reach the ${H.budget}-hour budget</div></div>
-    <div class="stat"><div class="lbl">Open tasks</div><div class="val">${open.length}</div><div class="sub">${doneWk.length} done this week</div></div>
-    <div class="stat"><div class="lbl">Needs Dr. Ghiassi</div><div class="val ${needsG.length ? 'neg' : ''}">${needsG.length}</div><div class="sub">${waiting.length} waiting on others</div></div>
+    ${isAll ? `    <div class="stat"><div class="lbl">Total hours logged</div><div class="val">${totalH.toFixed(2)} h</div><div class="sub">${weeksAsc.length} week(s) since ${fmtD(weeksAsc[0])}</div></div>
+    <div class="stat"><div class="lbl">Running balance</div><div class="val ${H.carried < 0 ? 'neg' : 'pos'}">${sgn(H.carried)} h</div><div class="sub">Through last week (vs ${H.budget} h/week)</div></div>
+    <div class="stat"><div class="lbl">Average per week</div><div class="val">${(totalH / Math.max(1, weeksAsc.length)).toFixed(2)} h</div><div class="sub">Includes this week so far</div></div>
+` : `    <div class="stat"><div class="lbl">Hours ${wl}</div><div class="val">${H.thisH.toFixed(2)} <span class="muted" style="font-size:14px">/ ${H.budget}</span></div><div class="sub">${weekLabel(H.curWeek)}${H.isCurrent && isAdmin() && (DB.eod_pending || []).length ? ` · ${(DB.eod_pending.reduce((a, l) => a + (l.minutes || 0), 0) / 60).toFixed(2)} h in unsent EOD` : ''}</div></div>
+    ${H.preTracking ? `<div class="stat"><div class="lbl">Balance carried in</div><div class="val muted">—</div><div class="sub">Before tracking started</div></div>
+    <div class="stat"><div class="lbl">Versus ${H.budget}-hour budget</div><div class="val ${H.thisH - H.budget < 0 ? 'neg' : 'pos'}">${sgn(H.thisH - H.budget)} h</div><div class="sub">That week only</div></div>`
+    : `<div class="stat"><div class="lbl">Balance carried in</div><div class="val ${H.carried < 0 ? 'neg' : 'pos'}">${sgn(H.carried)} h</div><div class="sub">${H.carried < 0 ? 'Hours to recoup' : 'Hours ahead'}</div></div>
+    ${H.isCurrent ? `<div class="stat"><div class="lbl">Still needed this week</div><div class="val">${H.needed.toFixed(2)} h</div><div class="sub">To reach the ${H.budget}-hour budget</div></div>`
+      : `<div class="stat"><div class="lbl">Balance after that week</div><div class="val ${H.after < 0 ? 'neg' : 'pos'}">${sgn(H.after)} h</div><div class="sub">Carried into the next week</div></div>`}`}
+`}
+    <div class="stat"><div class="lbl">Open tasks</div><div class="val">${open.length}</div><div class="sub">${doneWk.length} done ${wl}</div></div>
+    <div class="stat"><div class="lbl">Needs Dr. Ghiassi</div><div class="val ${needsG.length ? 'neg' : ''}">${needsG.length}</div><div class="sub">Her decisions or actions</div></div>
+    <div class="stat"><div class="lbl">Waiting on others</div><div class="val">${waiting.length}</div><div class="sub">Replies we're tracking</div></div>
+    <div class="stat"><div class="lbl">Worked vs paid</div><div class="val ${PS.balance < 0 ? 'neg' : 'pos'}">${sgn(PS.balance)} h</div><div class="sub">${PS.balance < 0 ? 'Paid hours still to recoup' : 'No hours owed'}</div></div>
   </div>
   <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); margin-top:16px">
     <div class="card"><h2>Hours per week (budget ${H.budget})</h2><div class="chartbox"><canvas id="c-weeks"></canvas></div></div>
-    <div class="card"><h2>Hours by category (this week)</h2><div class="chartbox"><canvas id="c-cats"></canvas></div></div>
+    <div class="card"><h2>Hours by category (${isAll ? 'all weeks' : weekLabel(H.curWeek)})</h2><div class="chartbox"><canvas id="c-cats"></canvas></div></div>
   </div>
+  ${isAll ? `  <div class="card"><h2>Running total by week</h2><table><tr><th>Week</th><th>Hours</th><th>Vs ${H.budget} h</th><th>Running balance</th></tr>
+    ${weeksAsc.slice().reverse().map(w => { const h = hoursSummary(w), diff = h.thisH - h.budget, bal = h.preTracking ? (addDays(w, 7) === weekStart(DB.settings.tracking_start) ? Number(DB.settings.opening_balance_hours || 0) : null) : h.isCurrent ? h.carried + h.thisH : h.after;
+      return `<tr><td>${weekLabel(w)}${h.isCurrent ? ' <span class="muted">(so far)</span>' : ''}</td><td>${h.thisH.toFixed(2)} h</td>
+        <td class="${h.isCurrent ? 'muted' : diff < 0 ? 'neg' : 'pos'}">${h.isCurrent ? 'in progress' : sgn(diff)}</td>
+        <td class="${bal === null ? 'muted' : bal < 0 ? 'neg' : 'pos'}">${bal === null ? 'before tracking' : sgn(bal) + (h.isCurrent ? ' <span class="muted">so far</span>' : '')}</td></tr>`; }).join('')}</table>
+    <p class="muted" style="margin-top:8px">Running balance = opening balance + hours worked − ${H.budget} per finished week. Negative means hours to recoup. Opening balance (from Nov 10–22): ${sgn(Number(DB.settings.opening_balance_hours || 0))} h.</p></div>
+` : `  <div class="card"><h2>Weekly report: work completed ${weekLabel(H.curWeek)} · ${H.thisH.toFixed(2)} h</h2>
+    ${Object.keys(wkDays).length ? Object.keys(wkDays).map(d => { const tot = wkDays[d].reduce((a, e) => a + e.minutes, 0);
+      return `<h2 style="margin-top:12px;font-size:14px">${parseD(d).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })} · ${(tot / 60).toFixed(2)} h</h2>
+      <table><tr><th>What was done</th><th class="hide-sm">Category</th><th>Time</th></tr>${wkDays[d].map(e => `<tr><td>${esc(e.note || (DB.tasks.find(t => t.id === e.task_id) || {}).title || '')}</td>
+        <td class="hide-sm">${esc(e.category || (DB.tasks.find(t => t.id === e.task_id) || {}).category || '')}</td><td>${e.minutes} min</td></tr>`).join('')}</table>`; }).join('')
+      : `<p class="muted">No work logged for this week yet${H.isCurrent ? ' (hours appear once each EOD is sent)' : ''}.</p>`}</div>
+`}
   <div class="card"><h2>Needs Dr. Ghiassi</h2>${miniTable(needsG)}</div>
   <div class="card"><h2>Due in the next 7 days</h2>${miniTable(dueSoon)}</div>
   <div class="card"><h2>Waiting on others</h2>${miniTable(waiting, true)}</div>`;
-  drawCharts(H);
+  $('#wk-sel').onchange = e => { selWeek = e.target.value; renderDashboard(); };
+  drawCharts({ ...H, curWeek: R.from, weekEnd: R.to });
 }
 function miniTable(list, showWho) {
   if (!list.length) return '<p class="muted">Nothing here.</p>';
@@ -264,7 +398,7 @@ function drawCharts(H) {
       { label: 'Budget', data: w.map(() => H.budget), type: 'line', borderColor: '#dc2626', borderDash: [6, 4], pointRadius: 0 }] },
     options: { maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } } });
   const byCat = {};
-  DB.entries.filter(e => e.entry_date >= H.curWeek).forEach(e => { const c = e.category || (DB.tasks.find(t => t.id === e.task_id) || {}).category || 'Other'; byCat[c] = (byCat[c] || 0) + e.minutes; });
+  DB.entries.filter(e => e.entry_date >= H.curWeek && e.entry_date < H.weekEnd).forEach(e => { const c = e.category || (DB.tasks.find(t => t.id === e.task_id) || {}).category || 'Other'; byCat[c] = (byCat[c] || 0) + e.minutes; });
   const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
   charts.c = new Chart($('#c-cats'), { type: 'bar', data: { labels: cats.map(c => c[0]), datasets: [{ data: cats.map(c => +(c[1] / 60).toFixed(2)), backgroundColor: '#1f3864' }] },
     options: { indexAxis: 'y', maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { beginAtZero: true, title: { display: true, text: 'Hours' } } } } });
@@ -295,7 +429,7 @@ function renderTasks() {
       <td class="hide-sm"><span class="pill pr-${esc(x.priority)}">${esc(x.priority)}</span></td>
       <td class="${x.due_date && x.due_date < t && x.status !== 'Done' ? 'overdue' : ''}">${fmtD(x.due_date)}</td>
       <td class="hide-sm">${taskMins(x.id) ? taskMins(x.id) + ' min' : ''}</td>
-      ${canEdit() ? `<td class="row-actions"><button class="btn sec sm" data-time="${x.id}">+ Time</button> <button class="btn sec sm" data-edit="${x.id}">Edit</button>${x.status !== 'Done' ? ` <button class="btn sec sm" data-done="${x.id}">Done</button>` : ''}</td>` : ''}
+      ${canEdit() ? `<td class="row-actions"><button class="btn sec sm" data-time="${x.id}">+ EOD</button> <button class="btn sec sm" data-edit="${x.id}">Edit</button>${x.status !== 'Done' ? ` <button class="btn sec sm" data-done="${x.id}">Done</button>` : ''}</td>` : ''}
     </tr>`).join('')}</table></div>`;
   $('#f-q').oninput = e => { filt.q = e.target.value; renderTasks(); const q = $('#f-q'); q.focus(); q.setSelectionRange(filt.q.length, filt.q.length); };
   $('#f-status').onchange = e => { filt.status = e.target.value; renderTasks(); };
@@ -319,7 +453,7 @@ function openTask(x = null) {
   ['title', 'category', 'due_date', 'waiting_on', 'notes'].forEach(k => f[k].value = x?.[k] || '');
   $('#dt-title').textContent = x ? 'Edit task' : 'New task';
   $('#dt-del').classList.toggle('hidden', !x);
-  $('#dt-del').onclick = async () => { if (!confirm('Delete this task? Its time entries stay in the log.')) return;
+  $('#dt-del').onclick = async () => { if (!(await confirmA('Delete this task? Its time entries stay in the log.'))) return;
     DB.tasks = DB.tasks.filter(y => y.id !== x.id); DB.entries.forEach(e => { if (e.task_id === x.id) e.task_id = null; });
     $('#d-task').close(); await saveData('Delete task'); render(); };
   f.onsubmit = async e => { e.preventDefault();
@@ -339,10 +473,62 @@ function openTime(taskId = null) {
   f.task_id.onchange = () => { const t2 = DB.tasks.find(x => x.id == f.task_id.value); if (t2) f.category.value = t2.category || ''; };
   f.querySelectorAll('.qm').forEach(b => b.onclick = () => f.minutes.value = (Number(f.minutes.value) || 0) + Number(b.dataset.m));
   f.onsubmit = async e => { e.preventDefault();
-    DB.entries.push({ id: newId(), task_id: f.task_id.value ? Number(f.task_id.value) : null, entry_date: f.entry_date.value,
-      minutes: Number(f.minutes.value), category: f.category.value.trim() || null, note: f.note.value.trim() || null });
-    $('#d-time').close(); await saveData('Log time'); render(); };
+    (DB.eod_pending ||= []).push({ id: newId(), task_id: f.task_id.value ? Number(f.task_id.value) : null, entry_date: f.entry_date.value,
+      minutes: f.minutes.value ? Number(f.minutes.value) : null, category: f.category.value.trim() || null, note: f.note.value.trim() || null });
+    $('#d-time').close(); await saveData(); render(); };
   $('#d-time').showModal();
+}
+
+/* ---------- EOD ----------
+   Work lines collect here (they can span several days if no EOD was sent).
+   "Mark EOD sent" moves them into the time log as completed work for their dates. */
+const mdy = s => { const [y, m, d] = s.split('-'); return `${m}/${d}/${y}`; };
+const lineText = l => l.note || (DB.tasks.find(t => t.id === l.task_id) || {}).title || '';
+const lineCat = l => l.category || (DB.tasks.find(t => t.id === l.task_id) || {}).category || 'Other';
+function renderEod() {
+  const P = DB.eod_pending ||= [], byDay = {};
+  P.forEach(l => (byDay[l.entry_date] ||= []).push(l));
+  const days = Object.keys(byDay).sort(), tot = P.reduce((a, l) => a + (l.minutes || 0), 0), missing = P.filter(l => !l.minutes).length;
+  const sent = [...(DB.eod_reports || [])].reverse().slice(0, 10);
+  $('#v-eod').innerHTML = `<div class="card">
+    <div class="filters"><button class="btn" id="eod-add">+ Add work</button>
+      <span class="muted">${P.length} line(s) not yet sent · ${tot} min (${(tot / 60).toFixed(2)} h)${missing ? ` · <span class="neg">${missing} without minutes</span>` : ''}</span></div>
+    ${days.length ? days.map(d => `<h2 style="margin-top:14px">${parseD(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}</h2>
+      <table><tr><th>What was done</th><th class="hide-sm">Task</th><th class="hide-sm">Category</th><th>Minutes</th><th></th></tr>
+      ${byDay[d].map(l => `<tr><td><textarea data-note="${l.id}" rows="2" style="min-height:0;width:100%;min-width:200px">${esc(lineText(l))}</textarea></td><td class="hide-sm muted">${esc((DB.tasks.find(t => t.id === l.task_id) || {}).title || '(general)')}</td>
+        <td class="hide-sm"><input data-cat="${l.id}" list="cats" value="${esc(lineCat(l))}" style="width:140px"></td>
+        <td><input type="number" min="1" step="1" style="width:80px" data-min="${l.id}" value="${l.minutes ?? ''}" placeholder="min"></td>
+        <td><button class="btn sec sm" data-ldel="${l.id}">Remove</button></td></tr>`).join('')}</table>`).join('')
+      : '<p class="muted">Nothing waiting. Use + Add work, or + EOD on a task, as you go.</p>'}
+    ${P.length ? `<div class="filters" style="margin-top:16px">
+      <button class="btn sec" id="eod-copy">Copy EOD text</button><button class="btn sec" id="eod-csv">Download CSV</button>
+      <label class="muted">Sent on <input id="eod-date" type="date" value="${today()}"></label>
+      <button class="btn" id="eod-send">Mark EOD sent</button></div><div class="err" id="eod-err"></div>` : ''}</div>
+  <div class="card"><h2>Sent EODs</h2>${sent.length ? `<table><tr><th>Sent</th><th>Days covered</th><th>Lines</th><th>Hours</th></tr>
+    ${sent.map(r => `<tr><td>${fmtD(r.sent_on)}</td><td>${r.dates.map(fmtD).join(', ')}</td><td>${r.lines}</td><td>${(r.minutes / 60).toFixed(2)}</td></tr>`).join('')}</table>` : '<p class="muted">None yet.</p>'}</div>`;
+  $('#eod-add').onclick = () => openTime();
+  const v = $('#v-eod');
+  v.onchange = async e => { const ds = e.target.dataset, id = ds.min || ds.note || ds.cat; if (!id) return; const l = P.find(x => x.id == id); if (!l) return;
+    if (ds.min) { const m = Number(e.target.value); l.minutes = m > 0 ? Math.round(m) : null; }
+    else if (ds.note) { const t = e.target.value.trim(); if (!t) { e.target.value = lineText(l); return; } l.note = t; }
+    else { l.category = e.target.value.trim() || null; }
+    await saveData(); render(); };
+  v.onclick = async e => { const b = e.target.closest('button'); if (!b) return;
+    if (b.dataset.ldel) { if (!(await confirmA('Remove this line?'))) return; DB.eod_pending = P.filter(x => x.id != b.dataset.ldel); await saveData(); render(); }
+    if (b.id === 'eod-copy') { const txt = days.map(d => `${mdy(d)}\n✅ Completed\n` + byDay[d].map(l => `• ${lineText(l)}`).join('\n')).join('\n\n');
+      try { await navigator.clipboard.writeText(txt); alertA('EOD text copied.'); } catch { ask('Copy the EOD text (it is selected; press Ctrl+C):', { ok: true, text: txt }); } }
+    if (b.id === 'eod-csv') { const q = x => /[",\n]/.test(x) ? `"${x.replace(/"/g, '""')}"` : x;
+      const csv = days.flatMap(d => byDay[d].map(l => [mdy(d), lineCat(l), lineText(l)].map(q).join(','))).join('\n') + '\n';
+      const dl = await claudeUse('downloads'), name = `eod_${days[days.length - 1]}.csv`;
+      if (dl) { try { await dl.save({ filename: name, data: csv }); return; } catch (err) { if (err && err.code !== 'unavailable') return; } }
+      const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' })); a.download = name; a.click(); }
+    if (b.id === 'eod-send') {
+      if (P.some(l => !l.minutes)) return $('#eod-err').textContent = 'Add minutes to every line before marking the EOD sent.';
+      const sentOn = $('#eod-date').value || today();
+      if (!(await confirmA(`Mark the EOD sent on ${fmtD(sentOn)}? ${P.length} line(s), ${(tot / 60).toFixed(2)} h move to the time log.`))) return;
+      P.forEach(l => DB.entries.push({ ...l, eod_sent: sentOn }));
+      (DB.eod_reports ||= []).push({ id: newId(), sent_on: sentOn, dates: days, lines: P.length, minutes: tot });
+      DB.eod_pending = []; await saveData(); render(); } };
 }
 
 /* ---------- time log ---------- */
@@ -350,19 +536,23 @@ function renderTime() {
   const H = hoursSummary(), byDay = {};
   DB.entries.forEach(e => (byDay[e.entry_date] ||= []).push(e));
   const days = Object.keys(byDay).sort().reverse().slice(0, 21);
-  $('#v-time').innerHTML = `<div class="card"><div class="filters"><span class="muted">This week: ${H.thisH.toFixed(2)} h · Balance carried in: ${H.carried.toFixed(2)} h · Still needed: ${H.needed.toFixed(2)} h</span></div>
+  $('#v-time').innerHTML = `<div class="card"><div class="filters">
+    <span class="muted">Logged from sent EODs. This week: ${H.thisH.toFixed(2)} h · Balance carried in: ${H.carried.toFixed(2)} h · Still needed: ${H.needed.toFixed(2)} h</span></div>
     ${days.length ? days.map(d => { const tot = byDay[d].reduce((a, e) => a + e.minutes, 0);
       return `<h2 style="margin-top:14px">${parseD(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · ${tot} min (${(tot / 60).toFixed(2)} h)</h2>
       <table>${byDay[d].map(e => `<tr><td>${esc((DB.tasks.find(t => t.id === e.task_id) || {}).title || '(general)')}${e.note ? `<div class="muted" style="font-size:12px">${esc(e.note)}</div>` : ''}</td>
-        <td class="hide-sm">${esc(e.category || '')}</td><td>${e.minutes} min</td></tr>`).join('')}</table>`; }).join('')
+        <td class="hide-sm">${esc(e.category || '')}</td><td>${e.minutes} min</td>${canEdit() ? `<td><button class="btn sec sm" data-del="${e.id}">Remove</button></td>` : ''}</tr>`).join('')}</table>`; }).join('')
       : '<p class="muted">No time logged yet.</p>'}</div>`;
+  if (!canEdit()) return;
+  $('#v-time').onclick = async e => { const b = e.target.closest('[data-del]'); if (!b || !(await confirmA('Remove this time entry?'))) return;
+    DB.entries = DB.entries.filter(x => x.id != b.dataset.del); await saveData('Remove time entry'); render(); };
 }
 
 /* ---------- users ---------- */
 function renderUsers() {
   $('#v-users').innerHTML = `<div class="card"><h2>Add a user</h2>
     <div class="filters"><input id="nu-name" placeholder="Full name"><input id="nu-user" placeholder="Username">
-    <input id="nu-pass" placeholder="Passcode (8+ characters)"><select id="nu-role"><option>viewer</option><option>admin</option></select>
+    <input id="nu-pass" placeholder="Passcode (4+ characters)"><select id="nu-role"><option>viewer</option><option>admin</option></select>
     <button class="btn" id="nu-btn">Add user</button></div><div class="err" id="nu-err"></div>
     <p class="muted">Send the person the link, their username and passcode.</p></div>
     <div class="card"><h2>Users</h2><table><tr><th>Name</th><th>Username</th><th>Role</th><th>Active</th><th></th></tr>
@@ -372,10 +562,11 @@ function renderUsers() {
       <td><button class="btn sec sm" data-reset="${i}">Set passcode</button> ${u.username !== me.username ? `<button class="btn sec sm" data-rm="${i}">Remove</button>` : ''}</td></tr>`).join('')}</table></div>`;
   $('#nu-btn').onclick = async () => {
     const name = $('#nu-name').value.trim(), user = $('#nu-user').value.trim(), pass = $('#nu-pass').value, role = $('#nu-role').value;
-    if (!user || pass.length < 8) return $('#nu-err').textContent = 'Enter a username and a passcode of at least 8 characters.';
+    $('#nu-err').textContent = '';
+    if (!user || pass.trim().length < 4) return $('#nu-err').textContent = 'Enter a username and a passcode of at least 4 characters.';
     if (DB.users.some(u => u.username.toLowerCase() === user.toLowerCase())) return $('#nu-err').textContent = 'That username already exists.';
     DB.users.push({ name, username: user, role, active: true, pass_hash: await hash(user, pass) });
-    if (await saveData('Add user')) { render(); alert(`User added: ${user}`); }
+    if (await saveData('Add user')) { render(); alertA(`User added: ${user}`); }
   };
   $('#v-users').onchange = async e => {
     if (e.target.dataset.role) DB.users[e.target.dataset.role].role = e.target.value;
@@ -384,10 +575,10 @@ function renderUsers() {
   };
   $('#v-users').onclick = async e => {
     const b = e.target.closest('button'); if (!b) return;
-    if (b.dataset.reset) { const u = DB.users[b.dataset.reset]; const p = prompt(`New passcode for ${u.username} (8+ characters):`);
-      if (!p) return; if (p.length < 8) return alert('Passcode must be at least 8 characters.');
-      u.pass_hash = await hash(u.username, p); if (await saveData('Set passcode')) alert('Passcode updated.'); }
-    if (b.dataset.rm) { const u = DB.users[b.dataset.rm]; if (!confirm(`Remove ${u.username}?`)) return;
+    if (b.dataset.reset) { const u = DB.users[b.dataset.reset]; const p = await promptA(`New passcode for ${u.username} (4+ characters):`);
+      if (!p) return; if (p.length < 4) return alertA('Passcode must be at least 4 characters.');
+      u.pass_hash = await hash(u.username, p); if (await saveData('Set passcode')) alertA('Passcode updated.'); }
+    if (b.dataset.rm) { const u = DB.users[b.dataset.rm]; if (!(await confirmA(`Remove ${u.username}?`))) return;
       DB.users.splice(b.dataset.rm, 1); await saveData('Remove user'); render(); }
   };
 }
@@ -399,14 +590,13 @@ function renderSettings() {
   $('#v-settings').innerHTML = `<div class="card"><h2>Hours settings</h2>
     ${fields.map(([k, l]) => `<label class="muted" style="display:block;margin-top:10px">${l}</label><input data-k="${k}" value="${esc(S[k] ?? '')}">`).join('')}
     <div class="actions" style="justify-content:flex-start"><button class="btn" id="set-save">Save</button></div></div>
-    <div class="card"><h2>GitHub token on this device</h2><p class="muted">${token() ? 'A token is saved on this device.' : 'No token saved. Changes cannot be saved from this device.'}</p>
-    <div class="filters"><input id="tok" type="password" placeholder="Paste new token" style="min-width:280px"><button class="btn" id="tok-save">Save token</button><button class="btn sec" id="tok-del">Remove token</button></div></div>`;
+    <div class="card"><h2>Update Dr. Ghiassi's GitHub copy</h2><p class="muted">Her view on GitHub reads data.json. After changes, download it and upload it to the VAdashboard repo (Add file > Upload files > Commit).</p>
+    <button class="btn" id="exp-btn">Download data.json</button></div>`;
   $('#set-save').onclick = async () => {
     document.querySelectorAll('#v-settings [data-k]').forEach(i => { const v = i.value.trim(); S[i.dataset.k] = (i.dataset.k === 'tracking_start') ? v : Number(v); });
-    if (await saveData('Update settings')) alert('Saved.');
+    if (await saveData('Update settings')) alertA('Saved.');
   };
-  $('#tok-save').onclick = () => { const v = $('#tok').value.trim(); if (v) { store.set('va_gh_token', v); alert('Token saved on this device.'); render(); } };
-  $('#tok-del').onclick = () => { store.del('va_gh_token'); render(); };
+  $('#exp-btn').onclick = exportJson;
 }
 
 boot();
