@@ -58,16 +58,7 @@
   <button class="btn" id="li-btn" style="width:100%">Sign in</button>
 </div>
 
-<div id="gate-setup" class="card gate hidden">
-  <h2>First-time setup (admin)</h2>
-  <p class="muted">Create the admin account. You'll also need a GitHub token so the dashboard can save changes (see SETUP.md).</p>
-  <input id="su-name" placeholder="Your name">
-  <input id="su-user" placeholder="Admin username">
-  <input id="su-pass" type="password" placeholder="Admin passcode (8+ characters)">
-  <input id="su-token" type="password" placeholder="GitHub token">
-  <div class="err" id="su-err"></div>
-  <button class="btn" id="su-btn" style="width:100%">Create admin</button>
-</div>
+
 
 <div id="app" class="hidden">
   <header>
@@ -142,10 +133,6 @@ const b64enc = s => btoa(unescape(encodeURIComponent(s)));
 const b64dec = s => decodeURIComponent(escape(atob(s.replace(/\n/g, ''))));
 const apiUrl = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${DATA_PATH}`;
 async function loadData() {
-  if (token()) {   // admin device: read latest straight from GitHub
-    const r = await fetch(`${apiUrl}?ref=${GH_BRANCH}&t=${Date.now()}`, { headers: { Authorization: `Bearer ${token()}`, Accept: 'application/vnd.github+json' } });
-    if (r.ok) { const j = await r.json(); fileSha = j.sha; DB = JSON.parse(b64dec(j.content)); return; }
-  }
   const r = await fetch(`${DATA_PATH}?t=${Date.now()}`, { cache: 'no-store' });
   if (!r.ok) throw new Error('Could not load data.json');
   DB = await r.json();
@@ -181,12 +168,12 @@ const fmtD = s => s ? parseD(s).toLocaleDateString('en-US', { month: 'short', da
 /* ---------- boot / auth ---------- */
 async function boot() {
   try { await loadData(); } catch (e) { document.body.innerHTML = `<div class="card gate"><h2>Can't load data</h2><p>${esc(e.message)}</p></div>`; return; }
-  if (!DB.users || !DB.users.length) return show('#gate-setup');
+  if (!DB.users || !DB.users.length) { document.body.innerHTML = '<div class="card gate"><h2>Not set up yet</h2><p class="muted">No users in data.json.</p></div>'; return; }
   const u = sess.get('va_user'); me = DB.users.find(x => x.username === u && x.active !== false);
   if (!me) return show('#gate-login');
   startApp();
 }
-function show(id) { ['#gate-login', '#gate-setup', '#app'].forEach(x => $(x).classList.add('hidden')); $(id).classList.remove('hidden'); }
+function show(id) { ['#gate-login', '#app'].forEach(x => $(x).classList.add('hidden')); $(id).classList.remove('hidden'); }
 $('#li-btn').onclick = async () => {
   const user = $('#li-user').value.trim(), pass = $('#li-pass').value; $('#li-err').textContent = '';
   const u = DB.users.find(x => x.username.toLowerCase() === user.toLowerCase());
@@ -194,20 +181,15 @@ $('#li-btn').onclick = async () => {
   sess.set('va_user', u.username); me = u; startApp();
 };
 $('#li-pass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#li-btn').click(); });
-$('#su-btn').onclick = async () => {
-  const name = $('#su-name').value.trim(), user = $('#su-user').value.trim(), pass = $('#su-pass').value, tok = $('#su-token').value.trim();
-  if (!user || pass.length < 8 || !tok) return $('#su-err').textContent = 'Fill in all fields; passcode needs 8+ characters.';
-  store.set('va_gh_token', tok);
-  DB.users = [{ name, username: user, role: 'admin', active: true, pass_hash: await hash(user, pass) }];
-  if (await saveData('Create admin')) { sess.set('va_user', user); me = DB.users[0]; startApp(); } else { store.del('va_gh_token'); DB.users = []; }
-};
+
 $('#out-btn').onclick = () => { sess.del('va_user'); location.reload(); };
 const isAdmin = () => me && me.role === 'admin';
+const canEdit = () => false;  // read-only site: updates come from a new data.json upload
 
 function startApp() {
   show('#app'); $('#who').textContent = `${me.name || me.username} · ${me.role}`;
   const items = [['dashboard', 'Dashboard'], ['tasks', 'Tasks']];
-  if (isAdmin()) items.push(['time', 'Time log'], ['users', 'Users'], ['settings', 'Settings']);
+  if (isAdmin()) items.push(['time', 'Time log']);
   $('#nav').innerHTML = items.map(([k, l]) => `<button data-v="${k}">${l}</button>`).join('');
   $('#nav').onclick = e => { const v = e.target.dataset.v; if (v) { view = v; render(); } };
   render();
@@ -302,10 +284,10 @@ function renderTasks() {
       <select id="f-status"><option value="open">All open</option><option value="all" ${filt.status === 'all' ? 'selected' : ''}>All (incl. done)</option>${STATUSES.map(s => `<option ${filt.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
       <select id="f-owner"><option value="">Any owner</option>${OWNERS.map(o => `<option ${filt.owner === o ? 'selected' : ''}>${o}</option>`).join('')}</select>
       <select id="f-cat"><option value="">Any category</option>${cats.map(c => `<option ${filt.category === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
-      ${isAdmin() ? '<button class="btn" id="add-task">+ Add task</button>' : ''}
+      ${canEdit() ? '<button class="btn" id="add-task">+ Add task</button>' : ''}
     </div>
     <p class="muted">${list.length} task(s)</p>
-    <table><tr><th>Task</th><th class="hide-sm">Category</th><th>Owner</th><th>Status</th><th class="hide-sm">Priority</th><th>Due</th><th class="hide-sm">Time</th>${isAdmin() ? '<th></th>' : ''}</tr>
+    <table><tr><th>Task</th><th class="hide-sm">Category</th><th>Owner</th><th>Status</th><th class="hide-sm">Priority</th><th>Due</th><th class="hide-sm">Time</th>${canEdit() ? '<th></th>' : ''}</tr>
     ${list.map(x => `<tr>
       <td>${esc(x.title)}${x.waiting_on ? `<div class="muted" style="font-size:12px">Waiting on: ${esc(x.waiting_on)}</div>` : ''}${x.notes ? `<div class="muted" style="font-size:12px">${esc(x.notes)}</div>` : ''}</td>
       <td class="hide-sm">${esc(x.category || '')}</td><td>${esc(x.owner)}</td>
@@ -313,13 +295,13 @@ function renderTasks() {
       <td class="hide-sm"><span class="pill pr-${esc(x.priority)}">${esc(x.priority)}</span></td>
       <td class="${x.due_date && x.due_date < t && x.status !== 'Done' ? 'overdue' : ''}">${fmtD(x.due_date)}</td>
       <td class="hide-sm">${taskMins(x.id) ? taskMins(x.id) + ' min' : ''}</td>
-      ${isAdmin() ? `<td class="row-actions"><button class="btn sec sm" data-time="${x.id}">+ Time</button> <button class="btn sec sm" data-edit="${x.id}">Edit</button>${x.status !== 'Done' ? ` <button class="btn sec sm" data-done="${x.id}">Done</button>` : ''}</td>` : ''}
+      ${canEdit() ? `<td class="row-actions"><button class="btn sec sm" data-time="${x.id}">+ Time</button> <button class="btn sec sm" data-edit="${x.id}">Edit</button>${x.status !== 'Done' ? ` <button class="btn sec sm" data-done="${x.id}">Done</button>` : ''}</td>` : ''}
     </tr>`).join('')}</table></div>`;
   $('#f-q').oninput = e => { filt.q = e.target.value; renderTasks(); const q = $('#f-q'); q.focus(); q.setSelectionRange(filt.q.length, filt.q.length); };
   $('#f-status').onchange = e => { filt.status = e.target.value; renderTasks(); };
   $('#f-owner').onchange = e => { filt.owner = e.target.value; renderTasks(); };
   $('#f-cat').onchange = e => { filt.category = e.target.value; renderTasks(); };
-  if (isAdmin()) {
+  if (canEdit()) {
     $('#add-task').onclick = () => openTask();
     $('#v-tasks').onclick = async e => {
       const b = e.target.closest('button'); if (!b) return;
@@ -368,16 +350,12 @@ function renderTime() {
   const H = hoursSummary(), byDay = {};
   DB.entries.forEach(e => (byDay[e.entry_date] ||= []).push(e));
   const days = Object.keys(byDay).sort().reverse().slice(0, 21);
-  $('#v-time').innerHTML = `<div class="card"><div class="filters"><button class="btn" id="add-time">+ Log time</button>
-    <span class="muted">This week: ${H.thisH.toFixed(2)} h · Balance carried in: ${H.carried.toFixed(2)} h · Still needed: ${H.needed.toFixed(2)} h</span></div>
+  $('#v-time').innerHTML = `<div class="card"><div class="filters"><span class="muted">This week: ${H.thisH.toFixed(2)} h · Balance carried in: ${H.carried.toFixed(2)} h · Still needed: ${H.needed.toFixed(2)} h</span></div>
     ${days.length ? days.map(d => { const tot = byDay[d].reduce((a, e) => a + e.minutes, 0);
       return `<h2 style="margin-top:14px">${parseD(d).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })} · ${tot} min (${(tot / 60).toFixed(2)} h)</h2>
       <table>${byDay[d].map(e => `<tr><td>${esc((DB.tasks.find(t => t.id === e.task_id) || {}).title || '(general)')}${e.note ? `<div class="muted" style="font-size:12px">${esc(e.note)}</div>` : ''}</td>
-        <td class="hide-sm">${esc(e.category || '')}</td><td>${e.minutes} min</td><td><button class="btn sec sm" data-del="${e.id}">Remove</button></td></tr>`).join('')}</table>`; }).join('')
+        <td class="hide-sm">${esc(e.category || '')}</td><td>${e.minutes} min</td></tr>`).join('')}</table>`; }).join('')
       : '<p class="muted">No time logged yet.</p>'}</div>`;
-  $('#add-time').onclick = () => openTime();
-  $('#v-time').onclick = async e => { const b = e.target.closest('[data-del]'); if (!b || !confirm('Remove this time entry?')) return;
-    DB.entries = DB.entries.filter(x => x.id != b.dataset.del); await saveData('Remove time entry'); render(); };
 }
 
 /* ---------- users ---------- */
